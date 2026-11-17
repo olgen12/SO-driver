@@ -1,0 +1,213 @@
+#include <linux/init.h>          // Macros __init e __exit
+#include <linux/module.h>        // Macros essenciais para LKMs (MODULE_LICENSE, etc.)
+#include <linux/kernel.h>        // Funções do kernel como printk()
+#include <linux/fs.h>            // Estrutura file_operations e alloc_chrdev_region
+#include <linux/cdev.h>          // Estrutura cdev e funções de registro de caractere
+#include <linux/device.h>        // class_create e device_create (criação em /dev)
+#include <linux/uaccess.h>       // copy_to_user e copy_from_user
+#include <linux/mutex.h>         // Controle de concorrência com mutex
+
+#define DEVICE_NAME "caesar_driver"
+#define CLASS_NAME  "caesar_class"
+#define BUFFER_SIZE 1024
+#define CAESAR_SHIFT 3           // Deslocamento padrão da Cifra de César (+3)
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Equipe Sistemas Operacionais");
+MODULE_DESCRIPTION("Driver de caractere com Cifra de Cesar automatica e contador de escritas");
+MODULE_VERSION("1.0");
+
+/* Variáveis de controle do dispositivo */
+static dev_t dev_number;                      // Armazena Major e Minor
+static struct cdev caesar_cdev;               // Estrutura de dispositivo de caractere
+static struct class *caesar_class = NULL;     // Classe do dispositivo em /sys/class
+static struct device *caesar_device = NULL;   // Dispositivo em /dev
+
+/* Buffer interno e sincronização */
+static char kernel_buffer[BUFFER_SIZE];       // Armazena a mensagem já cifrada
+static size_t buffer_data_len = 0;            // Quantidade atual de bytes armazenados
+static int write_count = 0;                   // Requisito 6: contador de operações write()
+static DEFINE_MUTEX(caesar_mutex);            // Mutex para evitar condições de corrida
+
+/* Protótipos das operações de arquivo */
+static int dev_open(struct inode *inodep, struct file *filep);
+static int dev_release(struct inode *inodep, struct file *filep);
+static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t len, loff_t *offset);
+static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t len, loff_t *offset);
+
+/* Tabela de mapeamento entre syscalls e funções do driver */
+static struct file_operations fops = {
+    .owner   = THIS_MODULE,
+    .open    = dev_open,
+    .read    = dev_read,
+    .write   = dev_write,
+    .release = dev_release,
+};
+
+/**
+ * Callback para definir permissão 0666 automaticamente no nó /dev/caesar_driver,
+ * permitindo que a aplicação de teste rode sem exigir sudo a cada execução.
+ */
+static char *caesar_devnode(const struct device *dev, umode_t *mode)
+{
+    if (mode)
+        *mode = 0666;
+    return NULL;
+}
+
+/**
+ * Função auxiliar que aplica a Cifra de César (+3) apenas em caracteres alfabéticos.
+ * Números, espaços e pontuação permanecem inalterados.
+ */
+static char apply_caesar_cipher(char c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return ((c - 'A' + CAESAR_SHIFT) % 26) + 'A';
+    } else if (c >= 'a' && c <= 'z') {
+        return ((c - 'a' + CAESAR_SHIFT) % 26) + 'a';
+    }
+    return c;
+}
+
+/* Executada quando a aplicação chama open("/dev/caesar_driver", ...) */
+static int dev_open(struct inode *inodep, struct file *filep)
+{
+    printk(KERN_INFO "caesar_driver: Dispositivo aberto pelo processo PID %d\n", current->pid);
+    return 0;
+}
+
+/* Executada quando a aplicação chama close(fd) */
+static int dev_release(struct inode *inodep, struct file *filep)
+{
+    printk(KERN_INFO "caesar_driver: Dispositivo fechado pelo processo PID %d\n", current->pid);
+    return 0;
+}
+
+/* Executada quando a aplicação chama write(fd, ...) */
+static ssize_t dev_write(struct file *filep, const char __user *user_buffer, size_t len, loff_t *offset)
+{
+    size_t bytes_to_copy;
+    size_t i;
+
+    if (mutex_lock_interruptible(&caesar_mutex))
+        return -ERESTARTSYS;
+
+    /* Limita a escrita ao tamanho máximo do buffer interno */
+    bytes_to_copy = (len < BUFFER_SIZE - 1) ? len : (BUFFER_SIZE - 1);
+
+    /* Copia dados do espaço de usuário para o espaço do kernel de forma segura */
+    if (copy_from_user(kernel_buffer, user_buffer, bytes_to_copy) != 0) {
+        mutex_unlock(&caesar_mutex);
+        printk(KERN_ERR "caesar_driver: Falha ao copiar dados do User Space\n");
+        return -EFAULT;
+    }
+
+    /* Aplica a Cifra de César caractere por caractere */
+    for (i = 0; i < bytes_to_copy; i++) {
+        kernel_buffer[i] = apply_caesar_cipher(kernel_buffer[i]);
+    }
+    kernel_buffer[bytes_to_copy] = '\0';
+    buffer_data_len = bytes_to_copy;
+
+    /* Requisito 6: incrementa e registra o total de escritas */
+    write_count++;
+    printk(KERN_INFO "caesar_driver: Escrita #%d concluida (%zu bytes cifrados)\n",
+           write_count, bytes_to_copy);
+
+    mutex_unlock(&caesar_mutex);
+    return bytes_to_copy;
+}
+
+/* Executada quando a aplicação chama read(fd, ...) */
+static ssize_t dev_read(struct file *filep, char __user *user_buffer, size_t len, loff_t *offset)
+{
+    size_t bytes_to_send;
+
+    if (mutex_lock_interruptible(&caesar_mutex))
+        return -ERESTARTSYS;
+
+    /* Se offset já atingiu o fim dos dados armazenados, retorna 0 (EOF) */
+    if (*offset >= buffer_data_len) {
+        mutex_unlock(&caesar_mutex);
+        return 0;
+    }
+
+    bytes_to_send = buffer_data_len - *offset;
+    if (len < bytes_to_send)
+        bytes_to_send = len;
+
+    /* Transfere os dados cifrados do kernel para o buffer da aplicação */
+    if (copy_to_user(user_buffer, kernel_buffer + *offset, bytes_to_send) != 0) {
+        mutex_unlock(&caesar_mutex);
+        printk(KERN_ERR "caesar_driver: Falha ao enviar dados para o User Space\n");
+        return -EFAULT;
+    }
+
+    *offset += bytes_to_send;
+    printk(KERN_INFO "caesar_driver: Leitura de %zu bytes enviada ao User Space\n", bytes_to_send);
+
+    mutex_unlock(&caesar_mutex);
+    return bytes_to_send;
+}
+
+/* Função de inicialização chamada no comando insmod */
+static int __init caesar_init(void)
+{
+    int ret;
+
+    /* 1. Aloca dinamicamente números Major e Minor */
+    ret = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
+    if (ret < 0) {
+        printk(KERN_ERR "caesar_driver: Falha ao alocar numero Major\n");
+        return ret;
+    }
+
+    /* 2. Inicializa e registra o dispositivo de caractere (cdev) */
+    cdev_init(&caesar_cdev, &fops);
+    caesar_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&caesar_cdev, dev_number, 1);
+    if (ret < 0) {
+        unregister_chrdev_region(dev_number, 1);
+        printk(KERN_ERR "caesar_driver: Falha ao registrar cdev\n");
+        return ret;
+    }
+
+    /* 3. Cria a classe do dispositivo (compatível com kernels 6.4+ usados no Zorin OS 17) */
+    caesar_class = class_create(CLASS_NAME);
+    if (IS_ERR(caesar_class)) {
+        cdev_del(&caesar_cdev);
+        unregister_chrdev_region(dev_number, 1);
+        printk(KERN_ERR "caesar_driver: Falha ao criar classe do dispositivo\n");
+        return PTR_ERR(caesar_class);
+    }
+    caesar_class->devnode = caesar_devnode;
+
+    /* 4. Cria o arquivo /dev/caesar_driver automaticamente */
+    caesar_device = device_create(caesar_class, NULL, dev_number, NULL, DEVICE_NAME);
+    if (IS_ERR(caesar_device)) {
+        class_destroy(caesar_class);
+        cdev_del(&caesar_cdev);
+        unregister_chrdev_region(dev_number, 1);
+        printk(KERN_ERR "caesar_driver: Falha ao criar dispositivo em /dev\n");
+        return PTR_ERR(caesar_device);
+    }
+
+    printk(KERN_INFO "caesar_driver: Modulo carregado com sucesso! Major=%d Minor=%d\n",
+           MAJOR(dev_number), MINOR(dev_number));
+    return 0;
+}
+
+/* Função de limpeza chamada no comando rmmod */
+static void __exit caesar_exit(void)
+{
+    device_destroy(caesar_class, dev_number);
+    class_destroy(caesar_class);
+    cdev_del(&caesar_cdev);
+    unregister_chrdev_region(dev_number, 1);
+
+    printk(KERN_INFO "caesar_driver: Modulo removido. Total de operacoes de escrita realizadas: %d\n",
+           write_count);
+}
+
+module_init(caesar_init);
+module_exit(caesar_exit);
