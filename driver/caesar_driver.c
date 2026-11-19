@@ -13,7 +13,7 @@
 #define CAESAR_SHIFT 3           // Deslocamento padrão da Cifra de César (+3)
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Equipe Sistemas Operacionais");
+MODULE_AUTHOR("Kaique, João, Josué, Pedro");
 MODULE_DESCRIPTION("Driver de caractere com Cifra de Cesar automatica e contador de escritas");
 MODULE_VERSION("1.0");
 
@@ -42,6 +42,7 @@ static struct file_operations fops = {
     .read    = dev_read,
     .write   = dev_write,
     .release = dev_release,
+    .llseek = default_llseek,
 };
 
 /**
